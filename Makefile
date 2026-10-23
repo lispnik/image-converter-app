@@ -19,9 +19,13 @@ SBCL ?= sbcl
 -include local.mk
 
 IM_DIR ?= ../im
-# Optional sibling checkouts that shadow the pinned objc and asdf-macos-app.
+# Sibling checkouts that shadow the pinned objc and asdf-macos-app.
 OBJC_DIR ?=
-MACOS_APP_DIR ?=
+# The bundle needs an asdf-macos-app that puts Contents/Frameworks on CFFI's
+# search path before im's restore hook reopens its libraries; the release
+# ocicl.csv pins does it later, and IM loads from Homebrew.  Until a release
+# with that is pinned, the checkout beside this one; MACOS_APP_DIR= for the pin.
+MACOS_APP_DIR ?= ../asdf-macos-app
 
 # :IGNORE-INHERITED-CONFIGURATION so that a dependency missing from ocicl.csv
 # fails here, rather than resolving to whatever the developer's own source
@@ -43,8 +47,10 @@ LISP = $(SBCL) --non-interactive --no-userinit --no-sysinit \
 deps:
 	ocicl install
 
+# MallocScribble=1 fills each new heap block with 0xAA, which is what lets
+# tests/leak-tests.lisp see a byte IM wrote without setting it.
 test:
-	$(LISP) --eval '(asdf:load-system "image-converter/tests")' \
+	MallocScribble=1 $(LISP) --eval '(asdf:load-system "image-converter/tests")' \
 	        --eval '(uiop:quit (if (image-converter/tests:run-tests) 0 1))'
 
 run:

@@ -10,7 +10,7 @@ Built with SBCL, [objc](https://github.com/lispnik/objc) for AppKit,
 [im](https://github.com/lispnik/im) for reading and writing images, FiveAM for
 the tests and ocicl for the dependencies.
 
-![The window after converting a folder to ICO: three files ok, two failed](doc/window.png)
+![The window after converting a folder to JPEG at quality 75: four files ok, one failed](doc/window.png)
 
 ## Using it
 
@@ -25,11 +25,25 @@ the tests and ocicl for the dependencies.
 - **Output format** — every format IM has registered, asked of IM when the
   application starts: HEIF, AVIF, TIFF, JPEG, PNG, GIF, BMP, RAS, ICO, PNM,
   PFM, KRN, LED, SGI, PCX and TGA with the Homebrew build of tecgraf-im.
+- **Compression** — the format's compressions that IM can write: TIFF's LZW,
+  JPEG, DEFLATE and the rest, BMP's RLE, PNM's ASCII. Default is what IM uses
+  when none is asked for (LZW for TIFF). One that takes only some images says
+  so — `CCITTFAX4 (black and white only)` — and choosing it makes every image
+  that. Formats with one compression show it and offer no choice.
+- **Quality** — 0 to 100, for JPEG (75 unless changed), HEIF and AVIF (80),
+  and TIFF with JPEG compression.
+- **Lossless** — HEIF and AVIF only; quality is then not used.
+
+Each format keeps its own compression, quality and lossless setting, so
+choosing TIFF and then JPEG again finds JPEG as you left it.
 
 The list shows each image's path, relative to the input folder, and a status:
 blank until it is converted, then **ok** or **error**. **Double-click** a file
 to see where it came from, where it went, and the error, or what had to be
-changed to fit the format. Convert becomes Stop while it runs. The options are
+changed to fit the format. Files are converted several at once, one per
+processor, and the ones in progress say `converting…`. Convert becomes Stop
+while it runs; Stop finishes the files in hand and starts no more, and so does
+quitting. The options are
 remembered between launches.
 
 ![The details of a file that could not be converted](doc/details.png)
@@ -37,7 +51,8 @@ remembered between launches.
 ### Fitting an image to a format
 
 Formats store different kinds of image: a GIF must be a palette image, a JPEG
-cannot be one, PFM holds only floating-point samples, KRN only grayscale. IM
+cannot be one, PFM holds only floating-point samples, KRN only grayscale, and
+TIFF with a fax compression only black and white. IM
 refuses to write an image in a shape its format does not take, so a plain load
 and save fails for about a third of everyday pairs. Each image is therefore
 converted to the first shape the format accepts — its own, then without alpha,
@@ -53,6 +68,11 @@ then RGB, palette, grayscale and so on — and the details say what was changed:
 - An output never replaces an input. Converting a folder of PNGs to PNG in
   place writes `photo-png.png`; the status line warns when the output folder
   *is* the input folder.
+- Converting in place again does not convert the first run's output. Each file
+  written is marked, in an extended attribute
+  (`org.lispnik.image-converter.source`), with the file it came from, and a
+  marked file is left out of the list when that file is in the list too. A
+  folder of converted files chosen on its own is converted like any other.
 - Folders are compared after symbolic links are resolved, so `/tmp/x` and
   `/private/tmp/x` are recognised as the same folder.
 
@@ -61,13 +81,17 @@ you would expect when converting the same folder again.
 
 ## Building
 
-You need SBCL, ocicl, Homebrew's `tecgraf-im` 2.2.1 or later, and a checkout of
-[im](https://github.com/lispnik/im), which is not in the ocicl registry. By
-default it is looked for beside this directory, at `../im`.
+You need SBCL, ocicl, a `tecgraf-im` with the uninitialised-memory fixes (newer
+than 2.2.1; see Notes), and checkouts of
+[im](https://github.com/lispnik/im), which is not in the ocicl registry, and
+[asdf-macos-app](https://github.com/lispnik/asdf-macos-app), whose pinned
+release does not yet set up the bundle's library path early enough for im (see
+Notes). By default both are looked for beside this directory, at `../im` and
+`../asdf-macos-app`.
 
 ```sh
 make deps    # restore the dependencies ocicl.csv pins, into ./ocicl/
-make test    # the FiveAM suite
+make test    # the FiveAM suite; fails while the IM in use leaks memory into files
 make run     # run from source, unbundled
 make app     # build/Image Converter.app
 make icon    # draw res/icon.png again
@@ -76,7 +100,8 @@ make screenshot INPUT=/a/folder/of/images FORMAT=ICO   # doc/window.png, doc/det
 
 ```sh
 make app IM_DIR=~/src/im                 # im from somewhere else
-make app OBJC_DIR=~/Projects/common-lisp/objc MACOS_APP_DIR=~/Projects/common-lisp/asdf-macos-app
+make app OBJC_DIR=~/Projects/common-lisp/objc MACOS_APP_DIR=~/src/asdf-macos-app
+make app MACOS_APP_DIR=                  # the asdf-macos-app ocicl.csv pins
 ```
 
 The Makefile runs SBCL without your init file and with a source registry of
@@ -102,7 +127,9 @@ open -W --env IMAGE_CONVERTER_SELFTEST=$PWD/samples \
 ```
 
 The output goes to a new temporary folder (named in the log) unless
-`IMAGE_CONVERTER_SELFTEST_OUTPUT` says otherwise. The self test neither reads
+`IMAGE_CONVERTER_SELFTEST_OUTPUT` says otherwise.
+`IMAGE_CONVERTER_SELFTEST_COMPRESSION`, `_QUALITY` and `_LOSSLESS=1` set the
+format's settings. The self test neither reads
 nor changes the options remembered from the window.
 
 ## Layout
@@ -111,27 +138,60 @@ nor changes the options remembered from the window.
 |---|---|
 | `src/formats.lisp` | The formats IM can write, as the drop-down shows them |
 | `src/scan.lisp` | Finding the images in a folder; canonical paths |
+| `src/mark.lisp` | Marking each file written with its original, so a second run in place leaves it out |
 | `src/convert.lisp` | One file into one format, fitting the image to it |
 | `src/batch.lisp` | The list of files, where each goes, and how it went |
 | `src/macos/` | The window, the menu and `main` |
-| `tests/` | FiveAM: formats, scanning, conversion, planning, and the real window driven without clicks |
+| `tests/` | FiveAM: formats, scanning, conversion, planning, marking, IM leaking memory into files, and the real window driven without clicks |
 | `tools/` | The icon, drawn pixel by pixel with IM, and the screenshot tool |
 
-Conversion runs on the main thread, one file per pass of the run loop, so the
-window stays responsive, Stop takes effect at the next file, and nothing but
-the main thread touches AppKit or IM.
+Conversion runs on SBCL threads, one per processor (`start-batch` in
+`src/batch.lisp`). The workers call IM and nothing else: the main thread looks
+at what they have finished ten times a second, and is the only one that
+touches AppKit or the Objective-C bridge. `IMAGE_CONVERTER_WORKERS=n` sets how
+many run at once.
 
 ## Notes
 
 - **IM's libraries in the bundle.** `im` reopens its libraries in an image
-  restore hook, which runs before asdf-macos-app adds `Contents/Frameworks` to
-  CFFI's search path. Left alone, the application loaded Homebrew's copies
-  beside the bundled ones, and HEIF and AVIF went missing from the format list.
-  `src/macos/frameworks.lisp` installs a restore hook that runs first and
-  points `im:*library-path*` at the bundle. Check with
-  `vmmap <pid> | grep dylib`: everything IM should come from `Contents/Frameworks`.
+  restore hook. asdf-macos-app used to add `Contents/Frameworks` to CFFI's
+  search path only afterwards, in its toplevel, so the application loaded
+  Homebrew's copies beside the bundled ones, and HEIF and AVIF went missing
+  from the format list. asdf-macos-app now does it in a restore hook that runs
+  before all the others. Check with `vmmap <pid> | grep dylib`: everything IM
+  should come from `Contents/Frameworks`.
 - **ICO** holds images up to 255×255 pixels; a larger one is an error that
   says so rather than IM's "invalid or unsupported image data".
 - **Alpha.** IM reports that every format can store alpha, then JPEG and PNM
   drop it silently. The written file's header is read back, and the details
   say when the alpha channel was lost.
+- **Dropping alpha.** Not with `im:convert-to-bitmap`: for 8-bit images it is
+  IM's colour space conversion, which copies nothing when the space is
+  unchanged, and an RGBA image came out black. The image is duplicated and its
+  alpha plane removed instead. The tests compare samples, not only sizes.
+- **LED** is said to store RGB, and its writer keeps only the red channel. A
+  colour image that reads back gray counts as refused, and is written as a
+  palette instead.
+- **Threads, and not Grand Central Dispatch.** A stock SBCL stops the world
+  for a collection by signalling every thread in Lisp, and macOS will not
+  signal a GCD worker, so Lisp running on several of them at once dies at the
+  first collection (see `examples/gcd.lisp` in objc). The work is IM's, in C,
+  and SBCL threads run foreign calls in parallel, so GCD would buy nothing.
+- **IM on several threads.** Safe but for three static buffers, found by
+  converting 384 files on one thread and on eight and comparing the decoded
+  images: the format and compression lists (read once and cached), the RGB to
+  palette quantizer and the PNG writer's text-chunk count (both under
+  `*im-lock*`, `src/formats.lisp`).
+- **IM 2.2.1 writes memory it never set into files**, where it can carry
+  anything the application had in memory: the padding at the end of each line
+  of a BMP, ICO, PCX or Sun raster (heap), the unused palette entries of an
+  indexed PCX (stack), and the GIF interlaced flag. The decoded images are
+  correct, which is how it went unnoticed. It is fixed in lispnik/tecgraf-im,
+  whose `test/test_uninit.cpp` writes every format twice over differently
+  filled memory and requires identical files. Since the bundle carries the IM
+  it is built against, `tests/leak-tests.lisp` fails while that IM is an
+  unfixed one; `make test` runs it with `MallocScribble=1`, which makes macOS
+  fill every new heap block with 0xAA so that a byte IM did not set shows.
+- **Quality** has no name common to the formats: each driver reads an image
+  attribute of its own (`JPEGQuality`, `Quality`, `Lossless`) and ignores the
+  rest. `*quality-attributes*` in `src/convert.lisp` lists them.

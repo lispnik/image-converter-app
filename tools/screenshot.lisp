@@ -84,9 +84,11 @@ its content, which has no background of its own to draw."
                              (ic::relative-name (ic:entry-output entry)
                                                 (format nil "~a/Converted"
                                                         (string-right-trim "/" input))))))
-        (setf (ic::controller-running controller) t
-              (ic::controller-next controller) 0)
-        (loop while (ic::convert-step controller))
+        (ic:wait-for-batch (ic:start-batch (ic::controller-entries controller)
+                                           (ic::selected-format controller)
+                                           :settings (ic::current-settings controller)))
+        (objc:invoke (ic::controller-table controller) "reloadData")
+        (ic::refresh-controls controller)
         ;; Select the first failure, as a double-click on it would.
         (let* ((entries (ic::controller-entries controller))
                (row (or (position :error entries :key #'ic:entry-status) 0)))

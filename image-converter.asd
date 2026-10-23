@@ -9,13 +9,14 @@
   :author "Matthew Kennedy <burnsidemk@gmail.com>"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("im")
+  :depends-on ("im" "cffi")
   :components ((:module "src"
                 :serial t
                 :components ((:file "package")
                              (:file "formats")
                              (:file "scan")
                              (:file "convert")
+                             (:file "mark")
                              (:file "batch"))))
   :in-order-to ((test-op (test-op "image-converter/tests"))))
 
@@ -43,6 +44,8 @@
                              (:file "scan-tests")
                              (:file "convert-tests")
                              (:file "batch-tests")
+                             (:file "mark-tests")
+                             (:file "leak-tests")
                              (:file "ui-tests"))))
   ;; FIVEAM:RUN! prints failures but returns NIL, and ASDF discards what a
   ;; TEST-OP returns, so the failure has to be an error.

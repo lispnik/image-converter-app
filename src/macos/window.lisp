@@ -5,10 +5,11 @@
 ;;;; change to any option scans the input folder again and plans where each
 ;;;; file is to go.
 ;;;;
-;;;; Converting runs on the main thread, one file each pass of the run loop:
-;;;; each step converts a file, redraws, and queues the next.  So the window
-;;;; keeps answering between files, Stop is honoured at the next one, and no
-;;;; thread other than the main one ever touches AppKit or IM.
+;;;; Converting runs on worker threads, one file each at a time (START-BATCH,
+;;;; batch.lisp).  The workers touch neither AppKit nor the Objective-C bridge:
+;;;; the main thread looks ten times a second at what they have finished,
+;;;; redraws, and logs it.  Stop hands out no more files and lets the ones
+;;;; being converted finish.
 
 (in-package #:image-converter)
 
@@ -18,6 +19,17 @@
    (output-field :initform nil :accessor controller-output-field)
    (recursive-checkbox :initform nil :accessor controller-recursive-checkbox)
    (format-popup :initform nil :accessor controller-format-popup)
+   (compression-popup :initform nil :accessor controller-compression-popup)
+   (compression-names :initform '() :accessor controller-compression-names
+                      :documentation "The compression of each item in its drop-down,
+NIL for Default.")
+   (quality-slider :initform nil :accessor controller-quality-slider)
+   (quality-label :initform nil :accessor controller-quality-label)
+   (lossless-checkbox :initform nil :accessor controller-lossless-checkbox)
+   (format-settings :initform (make-hash-table :test #'equalp)
+                    :accessor controller-format-settings
+                    :documentation "Each format's settings, by its name, as a plist
+of :COMPRESSION, :QUALITY and :LOSSLESS: what the settings row shows for it.")
    (table :initform nil :accessor controller-table)
    (status-label :initform nil :accessor controller-status-label)
    (convert-button :initform nil :accessor controller-convert-button)
@@ -28,10 +40,15 @@
    (entries :initform #() :accessor controller-entries
             :documentation "The table's rows.")
    (running :initform nil :accessor controller-running)
-   (next :initform 0 :accessor controller-next
-         :documentation "The row converted next, while running.")
+   (run :initform nil :accessor controller-run
+        :documentation "The BATCH-RUN converting, while running.")
+   (stopping :initform nil :accessor controller-stopping
+             :documentation "Stop was pressed, and the files in hand are being finished.")
    (message :initform nil :accessor controller-message
-            :documentation "Something to say in place of the count of files."))
+            :documentation "Something to say in place of the count of files.")
+   (skipped :initform 0 :accessor controller-skipped
+            :documentation "How many files in the folder an earlier run wrote,
+and so are not listed."))
   (:objc-class-name "ImageConverterWindowController"))
 
 (defmacro define-controller-method ((selector result-type &key on-error)
@@ -120,6 +137,7 @@ tests bind it to NIL, so as not to change the settings of whoever runs them.")
                          :key #'output-format-name :test #'string-equal)))
     (when index
       (objc:invoke (controller-format-popup controller) "selectItemAtIndex:" index)
+      (show-format-settings controller)
       t)))
 
 (defun directory-exists-p (path)
@@ -138,8 +156,11 @@ tests bind it to NIL, so as not to change the settings of whoever runs them.")
          (ok (count-status controller :ok))
          (errors (count-status controller :error)))
     (cond ((controller-message controller))
+          ((controller-stopping controller)
+           (format nil "Stopping: finishing the files in hand (~d of ~d converted)…"
+                   (+ ok errors) total))
           ((controller-running controller)
-           (format nil "Converting ~d of ~d…" (min total (1+ (controller-next controller))) total))
+           (format nil "Converted ~d of ~d…" (+ ok errors) total))
           ((plusp (+ ok errors))
            (format nil "~d converted, ~d failed~@[ — double-click a file to see why~]."
                    ok errors (plusp errors)))
@@ -150,21 +171,32 @@ tests bind it to NIL, so as not to change the settings of whoever runs them.")
           ((zerop total)
            (format nil "No images in this folder~:[~; or its subfolders~]." (recursive-p controller)))
           ((same-folder-p controller)
-           (format nil "~d image~:p to convert, beside the originals: the output folder is the input folder."
-                   total))
+           (format nil "~d image~:p to convert, beside the originals: the output folder is the input folder.~a"
+                   total (skipped-text controller)))
           (t
-           (format nil "~d image~:p to convert." total)))))
+           (format nil "~d image~:p to convert.~a" total (skipped-text controller))))))
+
+(defun skipped-text (controller)
+  (let ((skipped (controller-skipped controller)))
+    (if (plusp skipped)
+        (format nil " ~d converted by an earlier run ~:*~[~;is~:;are~] not listed." skipped)
+        "")))
 
 (defun refresh-controls (controller)
   "Make the controls agree with the state: the status line, the button's
 title, and which options can be changed."
   (let ((running (controller-running controller)))
     (objc:invoke (controller-status-label controller) "setStringValue:" (status-line controller))
-    (objc:invoke (controller-convert-button controller) "setTitle:" (if running "Stop" "Convert"))
+    (objc:invoke (controller-convert-button controller) "setTitle:"
+                 (cond ((controller-stopping controller) "Stopping…")
+                       (running "Stop")
+                       (t "Convert")))
     (objc:invoke (controller-convert-button controller) "setEnabled:"
-                 (or running (plusp (length (controller-entries controller)))))
+                 (and (not (controller-stopping controller))
+                      (or running (plusp (length (controller-entries controller))))))
     (dolist (control (controller-option-controls controller))
-      (objc:invoke control "setEnabled:" (not running)))))
+      (objc:invoke control "setEnabled:" (not running)))
+    (enable-setting-controls controller)))
 
 (defun output-excluded (input output)
   "OUTPUT, when it is a folder inside INPUT and so must be left out of the
@@ -189,21 +221,26 @@ Any statuses from a conversion are cleared: they were for other options."
          (output (let ((output (output-path controller)))
                    (if (plusp (length output)) (canonical-path output) "")))
          (format (selected-format controller))
-         (paths (and (directory-exists-p input)
+         (found (and (directory-exists-p input)
                      (scan-directory input :recursive (recursive-p controller)
-                                           :exclude (output-excluded input output))))
-         (entries (mapcar (lambda (path)
-                            (make-entry :input path :relative (relative-name path input)))
-                          paths)))
-    (when (and format (plusp (length output)))
-      (plan-batch entries output format))
-    (setf (controller-entries controller) (coerce entries 'vector)
-          (controller-message controller) nil)
+                                           :exclude (output-excluded input output)))))
+    ;; What an earlier run wrote beside the originals is not converted again.
+    (multiple-value-bind (paths skipped) (without-earlier-conversions found)
+      (let ((entries (mapcar (lambda (path)
+                               (make-entry :input path :relative (relative-name path input)))
+                             paths)))
+        (when (and format (plusp (length output)))
+          (plan-batch entries output format))
+        (setf (controller-entries controller) (coerce entries 'vector)
+              (controller-skipped controller) skipped
+              (controller-message controller) nil)))
     (objc:invoke (controller-table controller) "reloadData")
     (refresh-controls controller)
     controller))
 
 (defun options-changed (controller)
+  ;; The format may be another one, with settings of its own.
+  (show-format-settings controller)
   (rescan controller)
   (save-settings controller))
 
@@ -257,16 +294,144 @@ Converted inside it is suggested."
   (unless (controller-running self)
     (options-changed self)))
 
+;;; The format's settings ---------------------------------------------------------------
+;;;
+;;; Compression, quality and lossless belong to a format: TIFF's LZW means
+;;; nothing to JPEG.  So each format keeps its own, and choosing another
+;;; format shows that one's.  They are remembered as Compression.<format>,
+;;; Quality.<format> and Lossless.<format>, each a string.
+
+(defun format-settings (controller name)
+  "NAME's settings, as a plist: those chosen in this window, or remembered."
+  (let ((table (controller-format-settings controller)))
+    (multiple-value-bind (settings found) (gethash name table)
+      (if found
+          settings
+          (setf (gethash name table)
+                (let ((compression (default-string (format nil "Compression.~a" name)))
+                      (quality (default-string (format nil "Quality.~a" name)))
+                      (lossless (default-string (format nil "Lossless.~a" name))))
+                  (list :compression (and compression (plusp (length compression)) compression)
+                        :quality (and quality (ignore-errors (parse-integer quality)))
+                        :lossless (equal lossless "1"))))))))
+
+(defun set-format-settings (controller name &key compression quality lossless)
+  "Make NAME's settings these, and remember them."
+  (setf (gethash name (controller-format-settings controller))
+        (list :compression compression :quality quality :lossless lossless))
+  (when *remember-settings*
+    (let ((defaults (user-defaults)))
+      (objc:invoke defaults "setObject:forKey:" (or compression "")
+                   (format nil "Compression.~a" name))
+      (objc:invoke defaults "setObject:forKey:" (if quality (princ-to-string quality) "")
+                   (format nil "Quality.~a" name))
+      (objc:invoke defaults "setObject:forKey:" (if lossless "1" "0")
+                   (format nil "Lossless.~a" name))))
+  (when (let ((format (selected-format controller)))
+          (and format (string-equal name (output-format-name format))))
+    (show-format-settings controller)))
+
+(defun selected-compression (controller)
+  (let ((index (objc:invoke (controller-compression-popup controller) "indexOfSelectedItem")))
+    (and (<= 0 index) (nth index (controller-compression-names controller)))))
+
+(defun current-settings (controller)
+  "The selected format's settings as CONVERT-FILE takes them: the quality only
+where the format, with its compression, has one."
+  (let ((format (selected-format controller)))
+    (if (null format)
+        '()
+        (let* ((name (output-format-name format))
+               (settings (format-settings controller name))
+               (compression (getf settings :compression))
+               (lossless (and (getf settings :lossless) (lossless-available-p name))))
+          (multiple-value-bind (attribute default) (quality-attribute name compression)
+            (list :compression compression
+                  :quality (and attribute (not lossless) (or (getf settings :quality) default))
+                  :lossless lossless))))))
+
+(defun show-format-settings (controller)
+  "Fill the settings row with the selected format's."
+  (let ((popup (controller-compression-popup controller))
+        (format (selected-format controller)))
+    (objc:invoke popup "removeAllItems")
+    (setf (controller-compression-names controller) '())
+    (when format
+      (let* ((name (output-format-name format))
+             (choices (compression-choices name))
+             (settings (format-settings controller name))
+             (chosen (getf settings :compression)))
+        (objc:invoke popup "addItemWithTitle:"
+                     (if (= 1 (length choices)) (cdr (first choices)) "Default"))
+        (setf (controller-compression-names controller) (list nil))
+        (when (> (length choices) 1)
+          (dolist (choice choices)
+            (objc:invoke popup "addItemWithTitle:" (cdr choice))
+            (setf (controller-compression-names controller)
+                  (append (controller-compression-names controller) (list (car choice))))))
+        (objc:invoke popup "selectItemAtIndex:"
+                     (or (position chosen (controller-compression-names controller)
+                                   :test #'equalp)
+                         0))
+        (multiple-value-bind (attribute default) (quality-attribute name chosen)
+          (let ((quality (if attribute (or (getf settings :quality) default) 0)))
+            (objc:invoke (controller-quality-slider controller) "setIntegerValue:" quality)
+            (objc:invoke (controller-quality-label controller) "setStringValue:"
+                         (if attribute (princ-to-string quality) ""))))
+        (objc:invoke (controller-lossless-checkbox controller) "setState:"
+                     (if (and (getf settings :lossless) (lossless-available-p name)) 1 0)))))
+  (enable-setting-controls controller))
+
+(defun enable-setting-controls (controller)
+  "Each of the settings row's controls usable when the format has what it sets,
+and nothing while converting."
+  (let* ((running (controller-running controller))
+         (format (selected-format controller))
+         (name (and format (output-format-name format)))
+         (settings (and name (format-settings controller name)))
+         (lossless (and name (lossless-available-p name) (getf settings :lossless))))
+    (when (controller-compression-popup controller)
+      (objc:invoke (controller-compression-popup controller) "setEnabled:"
+                   (and (not running) (> (length (controller-compression-names controller)) 1)))
+      (let ((quality (and name (not lossless)
+                          (quality-attribute name (getf settings :compression)) t)))
+        (objc:invoke (controller-quality-slider controller) "setEnabled:"
+                     (and (not running) quality))
+        (objc:invoke (controller-quality-label controller) "setEnabled:"
+                     (and (not running) quality)))
+      (objc:invoke (controller-lossless-checkbox controller) "setEnabled:"
+                   (and (not running) name (lossless-available-p name))))))
+
+(defun settings-changed (controller)
+  "Take the settings row into the selected format's settings."
+  (let ((format (selected-format controller)))
+    (when format
+      (let* ((name (output-format-name format))
+             (compression (selected-compression controller)))
+        (set-format-settings
+         controller name
+         :compression compression
+         :quality (and (quality-attribute name compression)
+                       (objc:invoke (controller-quality-slider controller) "integerValue"))
+         :lossless (= 1 (objc:invoke (controller-lossless-checkbox controller) "state")))))))
+
+(define-controller-method ("settingsChanged:" :void) ((sender objc:objc-object-pointer))
+  (unless (controller-running self)
+    (settings-changed self)))
+
 ;;; Converting ------------------------------------------------------------------------
 
 (defvar *quit-when-done* nil
   "Whether the application quits when a conversion finishes: the self test.")
 
-(defun schedule-step (controller)
+(defparameter +progress-interval+ 0.1d0
+  "Seconds between the main thread's looks at what the workers have done.")
+
+(defun schedule-progress (controller)
   (objc:invoke (objc:objc-object-pointer controller)
                "performSelector:withObject:afterDelay:inModes:"
-               (objc:coerce-to-selector "convertStep:")
-               nil 0d0 +run-loop-modes+))
+               (objc:coerce-to-selector "conversionProgress:")
+               nil +progress-interval+ +run-loop-modes+))
 
 (defun start-converting (controller)
   "Check the options, plan the batch afresh, and begin.  True if it began."
@@ -288,55 +453,87 @@ Converted inside it is suggested."
                   nil)
                  (t
                   (save-settings controller)
-                  (note "converting ~d file~:p from ~a to ~a as ~a"
-                        (length (controller-entries controller)) input output
-                        (output-format-name format))
-                  (setf (controller-running controller) t
-                        (controller-next controller) 0)
+                  (let ((settings (current-settings controller)))
+                    (note "converting ~d file~:p from ~a to ~a as ~a, ~d at a time"
+                          (length (controller-entries controller)) input output
+                          (apply #'settings-text (output-format-name format) settings)
+                          (min (length (controller-entries controller))
+                               (or *worker-count* (processor-count))))
+                    (setf (controller-run controller)
+                          (start-batch (controller-entries controller) format
+                                       :settings settings)
+                          (controller-running controller) t
+                          (controller-stopping controller) nil))
                   (refresh-controls controller)
-                  (schedule-step controller)
+                  (schedule-progress controller)
                   t))))))
 
 (defun stop-converting (controller)
-  (setf (controller-running controller) nil)
-  (refresh-controls controller))
+  "Hand out no more files.  The run ends when the ones in hand are done."
+  (when (controller-run controller)
+    (stop-batch (controller-run controller))
+    (setf (controller-stopping controller) t)
+    (note "stopping")
+    (refresh-controls controller)))
 
-(defun convert-step (controller)
-  "Convert the next file, or finish.  Answers true while there is more to do."
-  (let ((entries (controller-entries controller))
-        (index (controller-next controller))
-        (format (selected-format controller)))
-    (cond ((not (controller-running controller)) nil)
-          ((or (>= index (length entries)) (null format))
-           (setf (controller-running controller) nil)
-           (note "done: ~d ok, ~d failed"
-                 (count-status controller :ok) (count-status controller :error))
-           (refresh-controls controller)
-           (when *quit-when-done*
-             (objc:invoke (objc.runloop:shared-application) "terminate:" nil))
-           nil)
-          (t
-           (let ((entry (aref entries index)))
-             (convert-entry entry format)
-             (note "~a: ~a~@[: ~a~]~@[ (~a)~]" (status-text (entry-status entry))
-                   (entry-input entry) (entry-message entry) (entry-note entry)))
-           (incf (controller-next controller))
-           (let ((table (controller-table controller)))
-             (objc:invoke table "reloadData")
-             (objc:invoke table "scrollRowToVisible:" index))
-           (refresh-controls controller)
-           t))))
+(defun finish-converting (controller)
+  (setf (controller-run controller) nil
+        (controller-running controller) nil
+        (controller-stopping controller) nil)
+  (note "done: ~d ok, ~d failed"
+        (count-status controller :ok) (count-status controller :error))
+  (objc:invoke (controller-table controller) "reloadData")
+  (refresh-controls controller)
+  (when *quit-when-done*
+    (objc:invoke (objc.runloop:shared-application) "terminate:" nil)))
+
+(defun collect-progress (controller)
+  "Log and show what the workers have finished since the last look, and end
+the run when they all have.  Answers true while it goes on."
+  (let ((run (controller-run controller)))
+    (if (null run)
+        nil
+        ;; Whether they are done first: what they finished before is then
+        ;; all in TAKE-FINISHED.
+        (let* ((done (batch-done-p run))
+               (finished (take-finished run))
+               (entries (controller-entries controller)))
+          (dolist (index finished)
+            (let ((entry (aref entries index)))
+              (note "~a: ~a~@[: ~a~]~@[ (~a)~]" (status-text (entry-status entry))
+                    (entry-input entry) (entry-message entry) (entry-note entry))))
+          (let ((table (controller-table controller)))
+            ;; The rows being converted change too, not only the finished.
+            (objc:invoke table "reloadData")
+            (when finished
+              (objc:invoke table "scrollRowToVisible:" (reduce #'max finished))))
+          (cond (done
+                 (finish-converting controller)
+                 nil)
+                (t
+                 (refresh-controls controller)
+                 t))))))
+
+(define-controller-method ("conversionProgress:" :void) ((argument objc:objc-object-pointer))
+  (when (collect-progress self)
+    (schedule-progress self)))
+
+(defun stop-and-wait (controller &key (timeout 30))
+  "Stop converting, and wait for the files in hand: for quitting, so that none
+is left half written."
+  (let ((run (controller-run controller)))
+    (when run
+      (stop-batch run)
+      (unless (wait-for-batch run :timeout timeout)
+        (note "quit with files still being converted")))))
 
 (define-controller-method ("convert:" :void) ((sender objc:objc-object-pointer))
   ;; So that a path still being typed is taken before it is read.
   (objc:invoke (controller-window self) "makeFirstResponder:" (cffi:null-pointer))
-  (if (controller-running self)
-      (stop-converting self)
-      (start-converting self)))
+  (cond ((controller-stopping self))
+        ((controller-running self) (stop-converting self))
+        (t (start-converting self))))
 
-(define-controller-method ("convertStep:" :void) ((argument objc:objc-object-pointer))
-  (when (convert-step self)
-    (schedule-step self)))
 
 ;;; Details ---------------------------------------------------------------------------
 
@@ -424,6 +621,7 @@ focus.  Without the focus a selection is pale grey, and wants ordinary text."
                                     ((not (string= "status" (column-key column))) "labelColor")
                                     ((eq status :ok) "systemGreenColor")
                                     ((eq status :error) "systemRedColor")
+                                    ((eq status :converting) "secondaryLabelColor")
                                     (t "labelColor"))))))
 
 ;;; Resting the pointer on a row says what double-clicking it would.
@@ -476,9 +674,9 @@ focus.  Without the focus a selection is pale grey, and wants ordinary text."
     (objc:invoke content "addSubview:" button)
     button))
 
-(defun add-checkbox (content title frame mask target)
+(defun add-checkbox (content title frame mask target &optional (action "optionsChanged:"))
   (let ((checkbox (objc:invoke "NSButton" "checkboxWithTitle:target:action:"
-                               title target (objc:coerce-to-selector "optionsChanged:"))))
+                               title target (objc:coerce-to-selector action))))
     (objc:invoke checkbox "setFrame:" frame)
     (objc:invoke checkbox "setAutoresizingMask:" mask)
     (objc:invoke content "addSubview:" checkbox)
@@ -539,12 +737,12 @@ focus.  Without the focus a selection is pale grey, and wants ordinary text."
     table))
 
 (defparameter +window-width+ 680d0)
-(defparameter +window-height+ 560d0)
-(defparameter +options-height+ 136d0)
+(defparameter +window-height+ 592d0)
+(defparameter +options-height+ 168d0)
 
 (defun add-options (controller content target)
   "The options pane, in a box across the top of the window: the two folders,
-whether to look in subfolders, and the format to write."
+whether to look in subfolders, the format to write, and its settings."
   (let* ((box (objc:invoke (objc:invoke "NSBox" "alloc") "initWithFrame:"
                            (vector 14d0 (- +window-height+ +options-height+ 10d0)
                                    (- +window-width+ 28d0) +options-height+))))
@@ -587,8 +785,43 @@ whether to look in subfolders, and the format to write."
           (setf (controller-format-popup controller)
                 (add-format-popup inner (vector 394d0 (- y 2d0) (- width 394d0 6d0) 26d0)
                                   wide target (controller-formats controller)))
-          (push (controller-format-popup controller) controls)))
+          (push (controller-format-popup controller) controls))
+        ;; The format's settings.  Not among the option controls: which of
+        ;; them can be used depends on the format (ENABLE-SETTING-CONTROLS).
+        (let ((y (- height 130d0)))
+          (add-label inner "Compression:" (vector 8d0 (+ y 3d0) 100d0 17d0) left :alignment 2)
+          (setf (controller-compression-popup controller)
+                (add-compression-popup inner (vector field-x (- y 2d0) 170d0 26d0) left target))
+          (add-label inner "Quality:" (vector 290d0 (+ y 3d0) 100d0 17d0) left :alignment 2)
+          (setf (controller-quality-slider controller)
+                (add-slider inner (vector 394d0 y (- width 394d0 140d0) 22d0) wide target)
+                (controller-quality-label controller)
+                (add-label inner "" (vector (- width 140d0) (+ y 3d0) 34d0 17d0) right)
+                (controller-lossless-checkbox controller)
+                (add-checkbox inner "Lossless" (vector (- width 100d0) (+ y 2d0) 94d0 18d0)
+                              right target "settingsChanged:"))))
       (setf (controller-option-controls controller) controls))))
+
+(defun add-compression-popup (content frame mask target)
+  "A drop-down of the format's compressions, filled by SHOW-FORMAT-SETTINGS."
+  (let ((popup (objc:invoke (objc:invoke "NSPopUpButton" "alloc")
+                            "initWithFrame:pullsDown:" frame nil)))
+    (objc:invoke popup "setAutoresizingMask:" mask)
+    (objc:invoke popup "setTarget:" target)
+    (objc:invoke popup "setAction:" (objc:coerce-to-selector "settingsChanged:"))
+    (objc:invoke content "addSubview:" popup)
+    (objc:release popup)
+    popup))
+
+(defun add-slider (content frame mask target)
+  "Quality, 0 to 100.  Continuous, so the number beside it follows the knob."
+  (let ((slider (objc:invoke "NSSlider" "sliderWithValue:minValue:maxValue:target:action:"
+                             75d0 0d0 100d0 target (objc:coerce-to-selector "settingsChanged:"))))
+    (objc:invoke slider "setFrame:" frame)
+    (objc:invoke slider "setAutoresizingMask:" mask)
+    (objc:invoke slider "setContinuous:" t)
+    (objc:invoke content "addSubview:" slider)
+    slider))
 
 (defun restore-settings (controller)
   "Put the remembered options into the controls."
@@ -603,8 +836,9 @@ whether to look in subfolders, and the format to write."
                  (if (default-bool "IncludeSubfolders") 1 0))
     (unless (and format (select-format controller format))
       ;; PNG, when nothing is remembered: lossless and everywhere.
-      (or (select-format controller "PNG")
-          (objc:invoke (controller-format-popup controller) "selectItemAtIndex:" 0)))))
+      (unless (select-format controller "PNG")
+        (objc:invoke (controller-format-popup controller) "selectItemAtIndex:" 0)
+        (show-format-settings controller)))))
 
 (defun make-window-controller ()
   "A controller with its window built and not yet shown."

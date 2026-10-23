@@ -118,3 +118,82 @@
                   (mapcar #'ic:entry-output entries))
           "~s" (mapcar #'ic:entry-output entries))
       (is (string= (path real "a-png.png") (ic:entry-output (first entries)))))))
+
+(test the-details-say-what-it-was-written-as
+  (with-temporary-directory (dir)
+    (make-sample (path dir "a.png"))
+    (let ((entry (first (ic:plan-batch (list (ic:make-entry :input (path dir "a.png")
+                                                            :relative "a.png"))
+                                       (path dir "out") (format-named "TIFF")))))
+      (ic:convert-entry entry (format-named "TIFF") :compression "JPEG" :quality 40)
+      (is (eq :ok (ic:entry-status entry)))
+      (is (string= "JPEG" (getf (im:file-info (native-pathname (ic:entry-output entry)))
+                                :compression)))
+      (is (search "As: TIFF, JPEG compression, quality 40"
+                  (nth-value 1 (ic:entry-details entry)))))))
+
+;;; Several threads ------------------------------------------------------------------
+
+(test a-batch-on-several-threads-converts-each-once
+  (with-temporary-directory (dir)
+    (let* ((kinds '(:rgb :rgba :map :gray))
+           (entries (coerce
+                     (ic:plan-batch
+                      (append
+                       (loop for i below 20
+                             for name = (format nil "sub~d/~2,'0d.png" (mod i 3) i)
+                             do (make-sample (path dir "in" name) :kind (nth (mod i 4) kinds))
+                             collect (ic:make-entry :input (path dir "in" name) :relative name))
+                       (progn (write-text (path dir "in" "bad.png") "no")
+                              (list (ic:make-entry :input (path dir "in" "bad.png")
+                                                   :relative "bad.png"))))
+                      (path dir "out") (format-named "GIF"))
+                     'vector))
+           (calls 0)
+           (lock (sb-thread:make-mutex))
+           (run (ic:start-batch entries (format-named "GIF")
+                                :workers 6
+                                :on-progress (lambda (run)
+                                               (declare (ignore run))
+                                               (sb-thread:with-mutex (lock) (incf calls))))))
+      (is-true (ic:wait-for-batch run :timeout 120))
+      (is-true (ic:batch-done-p run))
+      (let ((finished (ic:take-finished run)))
+        ;; Every entry finished, and each exactly once.
+        (is (equal (loop for i below (length entries) collect i)
+                   (sort (copy-list finished) #'<))))
+      (is (null (ic:take-finished run)))
+      ;; One call a file, and one as each worker ended.
+      (is (= (+ (length entries) 6) calls))
+      (loop for entry across entries
+            do (if (string= "bad.png" (ic:entry-relative entry))
+                   (is (eq :error (ic:entry-status entry)))
+                   (progn (is (eq :ok (ic:entry-status entry)) "~a: ~a"
+                              (ic:entry-relative entry) (ic:entry-message entry))
+                          (is (file-exists-p (ic:entry-output entry)))))))))
+
+(test stopping-a-batch-hands-out-no-more
+  (with-temporary-directory (dir)
+    (let* ((entries (coerce
+                     (ic:plan-batch
+                      (loop for i below 12
+                            for name = (format nil "~2,'0d.png" i)
+                            do (make-sample (path dir "in" name) :width 256 :height 256)
+                            collect (ic:make-entry :input (path dir "in" name) :relative name))
+                      (path dir "out") (format-named "TIFF"))
+                     'vector))
+           (run (ic:start-batch entries (format-named "TIFF") :workers 2)))
+      (ic:stop-batch run)
+      (is-true (ic:wait-for-batch run :timeout 60))
+      ;; At most one each for the two workers, finished rather than abandoned.
+      (is (<= (count :ok entries :key #'ic:entry-status) 2))
+      (is (notany (lambda (entry) (member (ic:entry-status entry) '(:converting :error)))
+                  entries)))))
+
+(test an-empty-batch-is-done-at-once
+  (let ((run (ic:start-batch #() (format-named "PNG"))))
+    (is-true (ic:batch-done-p run))
+    (is-true (ic:wait-for-batch run :timeout 1))))
+
+(test the-processor-count-is-sensible
+  (is (<= 1 (ic:processor-count) 1024)))

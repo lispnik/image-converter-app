@@ -21,7 +21,10 @@ target, a data source or a delegate.")
 (objc:define-objc-method ("applicationWillTerminate:" :void)
     ((self application-delegate) (notification objc:objc-object-pointer))
   (declare (ignorable self notification))
-  (handler-case (when *controller* (save-settings *controller*) (note "quit"))
+  (handler-case (when *controller*
+                  (stop-and-wait *controller*)
+                  (save-settings *controller*)
+                  (note "quit"))
     (error (condition) (note "applicationWillTerminate: ~a" condition))))
 
 ;;; The menu ----------------------------------------------------------------------
@@ -112,7 +115,9 @@ bundle is checked from a script, where nothing can click:
 
 The converted files go to a new temporary folder, which the log names, unless
 IMAGE_CONVERTER_SELFTEST_OUTPUT names another; IMAGE_CONVERTER_SELFTEST_FORMAT
-is the format, PNG if unset, and subfolders are included.  Only these are used:
+is the format, PNG if unset, and subfolders are included.
+IMAGE_CONVERTER_SELFTEST_COMPRESSION, _QUALITY and _LOSSLESS (1) are the
+format's settings, its defaults if unset.  Only these are used:
 the options remembered from the last time the window was used are neither read
 nor changed, because a test that converted whatever folder someone last chose
 would write into it."
@@ -131,8 +136,17 @@ would write into it."
     (objc:invoke (controller-input-field controller) "setStringValue:" input)
     (objc:invoke (controller-output-field controller) "setStringValue:" output)
     (objc:invoke (controller-recursive-checkbox controller) "setState:" 1)
-    (unless (select-format controller format)
-      (note "self test: no format ~a" format))
+    (if (select-format controller format)
+        (flet ((env (name)
+                 (let ((value (uiop:getenv name)))
+                   (and value (plusp (length value)) value))))
+          (set-format-settings
+           controller (output-format-name (selected-format controller))
+           :compression (env "IMAGE_CONVERTER_SELFTEST_COMPRESSION")
+           :quality (let ((quality (env "IMAGE_CONVERTER_SELFTEST_QUALITY")))
+                      (and quality (parse-integer quality :junk-allowed t)))
+           :lossless (equal (env "IMAGE_CONVERTER_SELFTEST_LOSSLESS") "1")))
+        (note "self test: no format ~a" format))
     (rescan controller)
     (note "self test: ~a to ~a as ~a: ~a" input output format (status-line controller))
     (unless (start-converting controller)
@@ -147,6 +161,11 @@ would write into it."
             (controller nil))
         (when self-test
           (setf *remember-settings* nil))
+        ;; How many files at once, when not one a processor: for measuring.
+        (let ((workers (ignore-errors
+                        (parse-integer (or (uiop:getenv "IMAGE_CONVERTER_WORKERS") "")))))
+          (when (and workers (plusp workers))
+            (setf *worker-count* workers)))
         (ensure-frameworks)
         (objc.runloop:shared-application)
         (note "IM formats: ~{~a~^ ~}" (mapcar #'output-format-name (output-formats)))

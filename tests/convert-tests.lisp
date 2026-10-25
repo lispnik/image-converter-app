@@ -182,6 +182,10 @@
                  (file-size output))))
         (is (< (size-at "JPEG" nil 10 "jpg") (size-at "JPEG" nil 95 "jpg")))
         (is (< (size-at "HEIF" nil 10 "heic") (size-at "HEIF" nil 95 "heic")))
+        (when (ic:find-output-format "WEBP")
+          (is (< (size-at "WEBP" nil 10 "webp") (size-at "WEBP" nil 95 "webp"))))
+        (when (ic:find-output-format "JXL")
+          (is (< (size-at "JXL" nil 10 "jxl") (size-at "JXL" nil 95 "jxl"))))
         (is (< (size-at "TIFF" "JPEG" 10 "tif") (size-at "TIFF" "JPEG" 95 "tif")))))))
 
 (test lossless-heif-keeps-the-picture
@@ -193,6 +197,48 @@
         (is (< (mean-difference original (gray-samples (path dir "exact.heic"))) 1))
         (is (> (mean-difference original (gray-samples (path dir "low.heic")))
                (mean-difference original (gray-samples (path dir "exact.heic")))))))))
+
+(test lossless-webp-and-jpeg-xl-keep-the-picture
+  (with-temporary-directory (dir)
+    (let* ((input (make-sample (path dir "in.png") :width 64 :height 64))
+           (original (gray-samples input)))
+      (loop for (format extension) in '(("WEBP" "webp") ("JXL" "jxl"))
+            when (ic:find-output-format format)
+              do (let ((exact (path dir (format nil "exact.~a" extension)))
+                       (low (path dir (format nil "low.~a" extension))))
+                   (ic:convert-file input exact format :lossless t)
+                   (ic:convert-file input low format :quality 1)
+                   (is (zerop (mean-difference original (gray-samples exact)))
+                       "~a lossless changed the picture" format)
+                   (is (> (mean-difference original (gray-samples low)) 0)
+                       "~a at quality 1 was exact" format))))))
+
+(defun float-range (path)
+  "The least and greatest sample in the float image at PATH."
+  (im:with-image (image (im:load (native-pathname path)))
+    (let ((count (* (im:width image) (im:height image)))
+          (low most-positive-single-float)
+          (high most-negative-single-float))
+      (dotimes (plane (if (eq (im:color-space image) :color-space-rgb) 3 1))
+        (let ((pointer (im:plane-pointer image plane)))
+          (dotimes (i count)
+            (let ((sample (cffi:mem-aref pointer :float i)))
+              (setf low (min low sample) high (max high sample))))))
+      (values low high (im:data-type image)))))
+
+(test float-formats-hold-white-as-one
+  "An 8-bit image in EXR, HDR or PFM holds 0 to 1.  It once held 0 to 255,
+which opened almost all white."
+  (with-temporary-directory (dir)
+    (let ((input (make-sample (path dir "in.png") :width 64 :height 64)))
+      (loop for (format extension) in '(("EXR" "exr") ("HDR" "hdr") ("PFM" "pfm"))
+            when (ic:find-output-format format)
+              do (let ((output (path dir (format nil "out.~a" extension))))
+                   (ic:convert-file input output format)
+                   (multiple-value-bind (low high type) (float-range output)
+                     (is (eq :data-type-float type) "~a read back as ~a" format type)
+                     (is (<= 0 low) "~a: least sample ~a" format low)
+                     (is (<= 0.5 high 1.01) "~a: greatest sample ~a" format high)))))))
 
 (test settings-that-do-not-apply-are-ignored
   (with-temporary-directory (dir)
@@ -206,4 +252,6 @@
   (is (string= "TIFF, LZW compression" (ic:settings-text "TIFF" :compression "LZW" :quality 60)))
   (is (string= "TIFF, JPEG compression, quality 60"
                (ic:settings-text "TIFF" :compression "JPEG" :quality 60)))
-  (is (string= "HEIF, lossless" (ic:settings-text "HEIF" :quality 60 :lossless t))))
+  (is (string= "HEIF, lossless" (ic:settings-text "HEIF" :quality 60 :lossless t)))
+  (is (string= "WEBP, quality 60" (ic:settings-text "WEBP" :quality 60)))
+  (is (string= "JXL, lossless" (ic:settings-text "JXL" :quality 60 :lossless t))))

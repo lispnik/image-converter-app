@@ -22,17 +22,20 @@ the tests and ocicl for the dependencies.
 - **Include subfolders** — list the images in every folder below the input
   too. An output folder inside the input folder is left out, so converting
   twice does not convert the first run's output.
-- **Output format** — every format IM has registered, asked of IM when the
-  application starts: HEIF, AVIF, TIFF, JPEG, PNG, GIF, BMP, RAS, ICO, PNM,
-  PFM, KRN, LED, SGI, PCX and TGA with the Homebrew build of tecgraf-im.
+- **Output format** — every format IM has registered and can write, asked of
+  IM when the application starts. With the Homebrew build of tecgraf-im 2.3.0:
+  HEIF, AVIF, WEBP, JXL, EXR, FITS, TIFF, JPEG, PNG, GIF, BMP, RAS, ICO, PNM,
+  PFM, HDR, QOI, KRN, LED, SGI, PCX and TGA. Camera raw files (DNG, CR2, NEF,
+  ARW and others, through LibRaw) are read and converted, but cannot be
+  written, so CAMRAW is not offered.
 - **Compression** — the format's compressions that IM can write: TIFF's LZW,
   JPEG, DEFLATE and the rest, BMP's RLE, PNM's ASCII. Default is what IM uses
   when none is asked for (LZW for TIFF). One that takes only some images says
   so — `CCITTFAX4 (black and white only)` — and choosing it makes every image
   that. Formats with one compression show it and offer no choice.
 - **Quality** — 0 to 100, for JPEG (75 unless changed), HEIF and AVIF (80),
-  and TIFF with JPEG compression.
-- **Lossless** — HEIF and AVIF only; quality is then not used.
+  WEBP (75), JXL (90), and TIFF with JPEG compression.
+- **Lossless** — HEIF, AVIF, WEBP and JXL; quality is then not used.
 
 Each format keeps its own compression, quality and lossless setting, so
 choosing TIFF and then JPEG again finds JPEG as you left it.
@@ -51,7 +54,7 @@ remembered between launches.
 ### Fitting an image to a format
 
 Formats store different kinds of image: a GIF must be a palette image, a JPEG
-cannot be one, PFM holds only floating-point samples, KRN only grayscale, and
+cannot be one, EXR, HDR and PFM hold only floating-point samples, KRN only grayscale, and
 TIFF with a fax compression only black and white. IM
 refuses to write an image in a shape its format does not take, so a plain load
 and save fails for about a third of everyday pairs. Each image is therefore
@@ -109,7 +112,8 @@ this tree (plus `IM_DIR`) alone, so a dependency missing from `ocicl.csv` fails
 the build rather than resolving from elsewhere on your machine.
 
 The bundle carries its own copies of IM and everything IM links against
-(libtiff, libjpeg, libpng, libheif and its codecs, …) in
+(libtiff, libjpeg, libpng, libheif and its codecs, libwebp, libjxl, OpenEXR,
+CFITSIO, LibRaw, …) in
 `Contents/Frameworks`, so it runs on a Mac without Homebrew. It is signed ad
 hoc unless `MACOS_SIGNING_IDENTITY` names a certificate; put that in
 `local.mk`, which is not committed.
@@ -192,6 +196,15 @@ many run at once.
   it is built against, `tests/leak-tests.lisp` fails while that IM is an
   unfixed one; `make test` runs it with `MallocScribble=1`, which makes macOS
   fill every new heap block with 0xAA so that a byte IM did not set shows.
+- **Floating-point formats** (EXR, HDR, PFM) are written with 8-bit samples
+  scaled to 0 to 1, white being 1. They were once written as 0 to 255, and
+  nearly every picture opened white. The values are the sRGB ones, not made
+  linear, so a viewer that treats EXR as linear light shows them lighter.
+- **`imFormatInfo` and CAMRAW.** IM copies a format's description and
+  extensions into the caller's buffers with no length, and documents 50
+  characters as the most either holds; tecgraf-im 2.3.0's CAMRAW lists 156
+  characters of extensions. `im:format-info` passes buffers of 1024 bytes,
+  and the fork lists fewer extensions (see its `CHANGES.md`).
 - **Quality** has no name common to the formats: each driver reads an image
   attribute of its own (`JPEGQuality`, `Quality`, `Lossless`) and ignores the
   rest. `*quality-attributes*` in `src/convert.lisp` lists them.

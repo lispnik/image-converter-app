@@ -75,7 +75,12 @@ that is removed afterwards."
       ((:rgb :gray)
        (im:save rgb (native-pathname path) :format format))
       (:rgba
+       ;; Opaque.  IM adds the plane as zeros, and a picture that is all
+       ;; transparent has no colour a lossy WebP or JPEG XL need keep.
        (im.ffi::%im-image-add-alpha (im:handle rgb))
+       (let ((alpha (im:plane-pointer rgb 3)))
+         (dotimes (i (* width height))
+           (setf (cffi:mem-aref alpha :uint8 i) 255)))
        (im:save rgb (native-pathname path) :format format))
       (:map
        (im:with-image (map (im:create width height :color-space-map :data-type-byte))

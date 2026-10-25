@@ -1,7 +1,8 @@
 ;;;; formats.lisp -- the formats IM can write, as the drop-down shows them.
 ;;;;
 ;;;; Asked of IM rather than written down here: which formats exist depends on
-;;;; which add-ons loaded (HEIF, AVIF and JP2 are optional), and that is only
+;;;; which add-ons loaded (HEIF, AVIF, JP2, WEBP, JXL, EXR, FITS and CAMRAW are
+;;;; optional), and that is only
 ;;;; known in the running application, not in the build.  Asked once a process,
 ;;;; though, and kept: IM answers in static buffers, which a second thread
 ;;;; asking at the same time overwrites (see *IM-LOCK*).
@@ -31,6 +32,9 @@
 (defmacro with-im-lock (() &body body)
   `(sb-thread:with-recursive-lock (*im-lock*) ,@body))
 
+(defvar *input-formats* nil
+  "INPUT-FORMATS, once asked.")
+
 (defvar *output-formats* nil
   "OUTPUT-FORMATS, once asked.")
 
@@ -41,7 +45,8 @@
   "Empty the caches, so that a saved image asks again: the bundle's IM may
 have formats the build's had not."
   (with-im-lock ()
-    (setf *output-formats* nil)
+    (setf *input-formats* nil
+          *output-formats* nil)
     (clrhash *format-compressions*)))
 
 (pushnew 'forget-formats sb-ext:*save-hooks*)
@@ -70,11 +75,11 @@ have formats the build's had not."
         while end
         do (setf start (1+ end))))
 
-(defun output-formats ()
-  "Every format IM has registered, in IM's order."
+(defun input-formats ()
+  "Every format IM has registered, in IM's order: what can be read."
   (with-im-lock ()
-    (or *output-formats*
-        (setf *output-formats*
+    (or *input-formats*
+        (setf *input-formats*
               (loop for name in (im:format-list)
                     for info = (ignore-errors (im:format-info name))
                     when info
@@ -82,6 +87,16 @@ have formats the build's had not."
                                :name (copy-seq name)
                                :description (copy-seq (first info))
                                :extensions (parse-extensions (second info))))))))
+
+(defun output-formats ()
+  "The registered formats that can be written, in IM's order.  CAMRAW, camera
+raw files, reads only: none of its compressions writes anything."
+  (with-im-lock ()
+    (or *output-formats*
+        (setf *output-formats*
+              (remove-if-not (lambda (format)
+                               (compression-choices (output-format-name format)))
+                             (input-formats))))))
 
 (defun output-format-extension (format)
   "The extension written for FORMAT: the first IM lists, else its name."
@@ -95,7 +110,7 @@ have formats the build's had not."
 (defun find-output-format (name &optional (formats (output-formats)))
   (find name formats :key #'output-format-name :test #'string-equal))
 
-(defun image-extensions (&optional (formats (output-formats)))
+(defun image-extensions (&optional (formats (input-formats)))
   "Every extension of every registered format: what counts as an image file."
   (remove-duplicates (loop for format in formats
                            append (output-format-extensions format))

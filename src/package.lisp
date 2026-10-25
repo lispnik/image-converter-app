@@ -6,7 +6,7 @@
    ;; formats
    #:output-format #:output-format-name #:output-format-description
    #:output-format-extensions #:output-format-extension #:output-format-title
-   #:output-formats #:find-output-format #:image-extensions
+   #:input-formats #:output-formats #:find-output-format #:image-extensions
    ;; scanning
    #:scan-directory #:image-file-p #:relative-name
    #:mark-converted #:converted-from #:without-earlier-conversions

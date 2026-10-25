@@ -51,11 +51,13 @@ image commonly refuse its alpha channel too.")
 (defparameter *quality-attributes*
   '(("JPEG" "JPEGQuality" 75)
     ("HEIF" "Quality" 80)
-    ("AVIF" "Quality" 80))
+    ("AVIF" "Quality" 80)
+    ("WEBP" "Quality" 75)
+    ("JXL" "Quality" 90))
   "Format, the attribute its driver reads quality from (0 to 100), and IM's
 default.  TIFF reads JPEGQuality too, when its compression is JPEG.")
 
-(defparameter *lossless-formats* '("HEIF" "AVIF")
+(defparameter *lossless-formats* '("HEIF" "AVIF" "WEBP" "JXL")
   "The formats whose driver reads a Lossless attribute.")
 
 (defun quality-attribute (format-name &optional compression)
@@ -203,10 +205,16 @@ colour conversions are written for."
                ;; Then the sample type.
                (typed (if (eq data-type :data-type-byte)
                           spaced
-                          ;; Upwards from 8 bits, so the values are kept.
+                          ;; Upwards from 8 bits.  Integers keep their
+                          ;; values.  Floats go to 0 to 1, which is white in
+                          ;; EXR, HDR and PFM; kept as they were, 0 to 255,
+                          ;; nearly all of the picture opened white.
                           (im:convert-data-type
                            spaced (own (im:create width height color-space data-type))
-                           :cast-mode :direct))))
+                           :cast-mode (if (member data-type '(:data-type-float
+                                                              :data-type-double))
+                                          :fixed
+                                          :direct)))))
           (when alpha
             (im.ffi::%im-image-add-alpha (im:handle typed)))
           ;; Everything made on the way but the answer.

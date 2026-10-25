@@ -11,7 +11,33 @@
       (is (member name names :test #'string=) "~a is missing from ~s" name names))))
 
 (test the-formats-are-exactly-im-s
-  (is (equal (im:format-list) (mapcar #'ic:output-format-name (ic:output-formats)))))
+  (is (equal (im:format-list) (mapcar #'ic:output-format-name (ic:input-formats))))
+  (is (subsetp (mapcar #'ic:output-format-name (ic:output-formats)) (im:format-list)
+               :test #'string=)))
+
+(defun loaded-p (library)
+  (im:library-loaded-p library))
+
+(test the-formats-of-im-2-3-are-offered-when-loaded
+  (let ((names (mapcar #'ic:output-format-name (ic:output-formats))))
+    (loop for (library format) in '((im::lib-im-webp "WEBP") (im::lib-im-jxl "JXL")
+                                    (im::lib-im-exr "EXR") (im::lib-im-fits "FITS"))
+          when (loaded-p library)
+            do (is (member format names :test #'string=) "~a is not offered" format))
+    (dolist (format '("QOI" "HDR"))
+      (when (member format (im:format-list) :test #'string=)
+        (is (member format names :test #'string=) "~a is not offered" format)))))
+
+(test camera-raw-is-read-but-not-offered
+  (if (not (loaded-p 'im::lib-im-camraw))
+      (skip "libim_camraw is not loaded")
+      (progn
+        (is (not (ic:find-output-format "CAMRAW")))
+        (is (find "CAMRAW" (ic:input-formats) :key #'ic:output-format-name
+                                              :test #'string=))
+        (dolist (extension '("dng" "cr2" "nef" "arw"))
+          (is (member extension (ic:image-extensions) :test #'string=)
+              "~a files are not picked up" extension)))))
 
 (test extensions-are-parsed-from-im-s-patterns
   (is (equal '("tif" "tiff") (ic::parse-extensions "*.tif;*.tiff;")))

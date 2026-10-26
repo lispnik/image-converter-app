@@ -110,13 +110,27 @@ jobs:
           # Everything IM links against is in Contents/Frameworks, so the
           # bundle runs on a Mac without Homebrew.
           contents="build/Image Converter.app/Contents"
-          outside=$(for f in "$contents"/Frameworks/*.dylib "$contents"/MacOS/image-converter; do
-                      otool -L "$f" | tail -n +2
-                    done | grep -vE "@loader_path|@executable_path|@rpath|/usr/lib|/System" || true)
-          if [ -n "$outside" ]; then
-            echo "::error::libraries referenced from outside the bundle:"
-            echo "$outside"
+          outside() {
+            for f in "$@"; do otool -L "$f" | tail -n +2; done \
+              | grep -vE "@loader_path|@executable_path|@rpath|/usr/lib/|/System/" || true
+          }
+          libraries=$(outside "$contents"/Frameworks/*.dylib)
+          if [ -n "$libraries" ]; then
+            echo "::error::bundled libraries link from outside the bundle:"
+            echo "$libraries"
             exit 1
+          fi
+          # The runtime is the building SBCL's.  Homebrew's links Homebrew's
+          # libzstd, for core compression, so this artifact is for testing
+          # only; a release is built with an SBCL configured
+          # --without-sb-core-compression (make release-check).
+          runtime=$(outside "$contents"/MacOS/image-converter)
+          if [ -n "$(echo "$runtime" | grep -v libzstd)" ]; then
+            echo "::error::the runtime links from outside the system:"
+            echo "$runtime"
+            exit 1
+          elif [ -n "$runtime" ]; then
+            echo "::warning::the runtime links Homebrew's libzstd; this bundle runs only where Homebrew's zstd is installed"
           fi
 
       - name: Upload the bundle

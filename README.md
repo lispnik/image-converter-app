@@ -118,6 +118,29 @@ CFITSIO, LibRaw, …) in
 hoc unless `MACOS_SIGNING_IDENTITY` names a certificate; put that in
 `local.mk`, which is not committed.
 
+### Releasing
+
+A release is a disk image of the bundle, both signed with a Developer ID and
+notarised. `local.mk` (not committed) names the certificate and a notary
+profile stored with `xcrun notarytool store-credentials`:
+
+```make
+MACOS_SIGNING_IDENTITY = Developer ID Application: Your Name (TEAMID)
+NOTARY_PROFILE = image-converter
+```
+
+```sh
+make app             # signed with the hardened runtime
+make release         # release-check, notarize, dmg, notarize-dmg
+```
+
+`make release-check` refuses a bundle signed ad hoc and one whose runtime links
+anything outside the system. The runtime is the building SBCL's, and
+Homebrew's links Homebrew's libzstd for core compression: build a release with
+an SBCL configured `--without-sb-core-compression`. The disk image is
+`dist/Image-Converter-<version>.dmg`, the version taken from
+`image-converter-app.asd`.
+
 ### Checking the bundle from a script
 
 Nothing can click in a script, so the application has a self test: given a

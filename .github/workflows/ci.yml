@@ -1,0 +1,128 @@
+# Test the converter, build the bundle, and convert a folder with it.
+#
+# The checkouts sit side by side, as the Makefile expects them: im is not in
+# the ocicl registry, and the bundle needs an asdf-macos-app newer than the
+# one ocicl.csv pins (see MACOS_APP_DIR in the Makefile).  IM itself is
+# Homebrew's tecgraf-im, built from lispnik/tecgraf, which has no bottles.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: app
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: app
+
+      - uses: actions/checkout@v4
+        with:
+          repository: lispnik/im
+          path: im
+
+      - uses: actions/checkout@v4
+        with:
+          repository: lispnik/asdf-macos-app
+          path: asdf-macos-app
+
+      - name: Install SBCL and tecgraf-im
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: |
+          brew install sbcl
+          brew tap lispnik/tecgraf
+          brew install lispnik/tecgraf/tecgraf-im
+          brew list --versions sbcl tecgraf-im
+
+      - name: Install ocicl
+        run: |
+          git clone --depth 1 https://github.com/ocicl/ocicl.git "$HOME/ocicl-src"
+          ( cd "$HOME/ocicl-src" && sbcl --non-interactive --load setup.lisp )
+          bin="$(find "$HOME" -type f -name ocicl 2>/dev/null | grep -v '/ocicl-src/' | head -1)"
+          test -n "$bin" || { echo "::error::ocicl binary not found after setup"; exit 1; }
+          dirname "$bin" >> "$GITHUB_PATH"
+          "$bin" setup > /dev/null
+
+      - name: Cache the ocicl dependency tree
+        uses: actions/cache@v4
+        with:
+          path: app/ocicl/
+          key: ${{ runner.os }}-ocicl-${{ hashFiles('app/ocicl.csv') }}
+
+      - name: Restore dependencies
+        run: |
+          # The registry is occasionally slow to answer; a retry is cheaper
+          # than a red build.
+          for attempt in 1 2 3; do
+            if make deps 2>&1 | tee ocicl-install.log \
+                 && ! grep -qE "failed to install|error downloading" ocicl-install.log; then
+              exit 0
+            fi
+            echo "::warning::ocicl install failed on attempt $attempt; retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::ocicl could not install every dependency"
+          exit 1
+
+      - name: Test
+        run: make test
+
+      - name: Build the bundle
+        run: make app
+
+      - name: Convert a folder with the bundle
+        run: |
+          # The application's self test: it converts the folder as soon as its
+          # window is up, writes each result to its log, and quits.
+          mkdir -p "$RUNNER_TEMP/in"
+          cp res/icon.png doc/*.png "$RUNNER_TEMP/in/"
+          count=$(ls "$RUNNER_TEMP/in" | wc -l | tr -d ' ')
+          log="$HOME/Library/Logs/Image Converter.log"
+          for format in PNG JPEG WEBP JXL HEIF EXR; do
+            rm -f "$log"
+            open -W --env IMAGE_CONVERTER_SELFTEST="$RUNNER_TEMP/in" \
+                    --env IMAGE_CONVERTER_SELFTEST_OUTPUT="$RUNNER_TEMP/out-$format" \
+                    --env IMAGE_CONVERTER_SELFTEST_FORMAT="$format" \
+                    "build/Image Converter.app"
+            cat "$log"
+            grep -q "done: $count ok, 0 failed" "$log" \
+              || { echo "::error::$format: the bundle did not convert all $count files"; exit 1; }
+          done
+
+      - name: Check the bundle carries its libraries
+        run: |
+          # Everything IM links against is in Contents/Frameworks, so the
+          # bundle runs on a Mac without Homebrew.
+          contents="build/Image Converter.app/Contents"
+          outside=$(for f in "$contents"/Frameworks/*.dylib "$contents"/MacOS/image-converter; do
+                      otool -L "$f" | tail -n +2
+                    done | grep -vE "@loader_path|@executable_path|@rpath|/usr/lib|/System" || true)
+          if [ -n "$outside" ]; then
+            echo "::error::libraries referenced from outside the bundle:"
+            echo "$outside"
+            exit 1
+          fi
+
+      - name: Upload the bundle
+        run: ditto -c -k --keepParent "build/Image Converter.app" "$RUNNER_TEMP/Image-Converter.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Image-Converter-macos-arm64
+          path: ${{ runner.temp }}/Image-Converter.zip

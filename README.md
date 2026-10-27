@@ -10,7 +10,7 @@ Built with SBCL, [objc](https://github.com/lispnik/objc) for AppKit,
 [im](https://github.com/lispnik/im) for reading and writing images, FiveAM for
 the tests and ocicl for the dependencies.
 
-![The window after converting a folder to JPEG at quality 75: four files ok, one failed](doc/window.png)
+![The window part way through converting a folder of holiday photos to WEBP: seven done, four converting, seven to go](doc/converting.png)
 
 ## Using it
 
@@ -48,6 +48,8 @@ processor, and the ones in progress say `converting…`. Convert becomes Stop
 while it runs; Stop finishes the files in hand and starts no more, and so does
 quitting. The options are
 remembered between launches.
+
+![The window after converting a folder to JPEG at quality 75: four files ok, one failed](doc/window.png)
 
 ![The details of a file that could not be converted](doc/details.png)
 
@@ -98,7 +100,8 @@ make test    # the FiveAM suite; fails while the IM in use leaks memory into fil
 make run     # run from source, unbundled
 make app     # build/Image Converter.app
 make icon    # draw res/icon.png again
-make screenshot INPUT=/a/folder/of/images FORMAT=ICO   # doc/window.png, doc/details.png
+make screenshot                     # doc/converting.png, staged
+make screenshot INPUT=/a/folder/of/images FORMAT=ICO   # and doc/window.png, doc/details.png
 ```
 
 ```sh

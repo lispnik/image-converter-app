@@ -76,9 +76,9 @@ jobs:
           brew install lispnik/tecgraf/tecgraf-im
           brew list --versions sbcl tecgraf-im
 
-      - name: Cache the bundle's SBCL
+      - name: Restore the bundle's SBCL
         id: sbcl-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/sbcl-${{ env.SBCL_VERSION }}
           key: ${{ runner.os }}-${{ runner.arch }}-sbcl-${{ env.SBCL_COMMIT }}-safepoint-nozstd
@@ -98,16 +98,31 @@ jobs:
             || { tail -100 build.log; exit 1; }
           sh install.sh > /dev/null
 
+      # Saved as soon as it is built, so that a later failure does not cost
+      # the next run another build.
+      - name: Save the bundle's SBCL
+        if: steps.sbcl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/sbcl-${{ env.SBCL_VERSION }}
+          key: ${{ steps.sbcl-cache.outputs.cache-primary-key }}
+
       - name: Use the bundle's SBCL
         run: |
           sbcl="$HOME/sbcl-$SBCL_VERSION/bin/sbcl"
           "$sbcl" --version
           otool -L "$sbcl"
+          # Not only the runtime: the core loads, and so do its contribs.
+          "$sbcl" --dynamic-space-size 3072 --non-interactive --no-userinit --no-sysinit \
+                  --eval '(require :asdf)' \
+                  --eval '(format t "~&~a ~a~%" (lisp-implementation-version) (asdf:asdf-version))'
           echo "SBCL=$sbcl" >> "$GITHUB_ENV"
 
       - name: Install ocicl
+        env:
+          # setup.lisp builds ocicl with $SBCL; it is a tool, and goes in no bundle.
+          SBCL: /opt/homebrew/bin/sbcl
         run: |
-          # Built with Homebrew's SBCL: it is a tool, and goes in no bundle.
           git clone --depth 1 https://github.com/ocicl/ocicl.git "$HOME/ocicl-src"
           ( cd "$HOME/ocicl-src" && /opt/homebrew/bin/sbcl --non-interactive --load setup.lisp )
           bin="$(find "$HOME" -type f -name ocicl 2>/dev/null | grep -v '/ocicl-src/' | head -1)"

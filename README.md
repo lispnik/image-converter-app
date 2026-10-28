@@ -142,7 +142,20 @@ anything outside the system. The runtime is the building SBCL's, and
 Homebrew's links Homebrew's libzstd for core compression: build a release with
 an SBCL configured `--without-sb-core-compression`. The disk image is
 `dist/Image-Converter-<version>.dmg`, the version taken from
-`image-converter-app.asd`.
+`image-converter-app.asd`. `make disk-image` makes one from the bundle as it
+is, notarised or not.
+
+CI makes the disk image on every push, with an SBCL 2.6.8 it builds the same
+way (threads, safepoints, no core compression), and keeps it as the run's
+artifact. Pushing a tag `v<version>` also publishes it as a GitHub release.
+With the repository secrets listed at the top of `.github/workflows/ci.yml` (a
+Developer ID certificate and an App Store Connect API key) CI signs and
+notarises it; without them the app inside is signed ad hoc, and macOS opens it
+only once its quarantine is removed:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Image Converter.app"
+```
 
 ### Checking the bundle from a script
 

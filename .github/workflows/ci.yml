@@ -1,24 +1,50 @@
-# Test the converter, build the bundle, and convert a folder with it.
+# Test the converter, build the bundle, convert a folder with it, and make a
+# disk image of it.  A v* tag also publishes the disk image as a release.
 #
 # The checkouts sit side by side, as the Makefile expects them: im is not in
 # the ocicl registry, and the bundle needs an asdf-macos-app newer than the
 # one ocicl.csv pins (see MACOS_APP_DIR in the Makefile).  IM itself is
 # Homebrew's tecgraf-im, built from lispnik/tecgraf, which has no bottles.
+#
+# The bundle carries the building SBCL's runtime.  Homebrew's links Homebrew's
+# libzstd, so the bundle is built with an SBCL of its own, configured as the
+# release is: threads and safepoints, no core compression.
+#
+# Signing and notarising happen only when the repository has these secrets;
+# without them the disk image holds an ad hoc signed app.
+#   MACOS_CERTIFICATE           a Developer ID Application certificate and key, .p12, base64
+#   MACOS_CERTIFICATE_PASSWORD  the .p12's password
+#   APPLE_API_KEY               an App Store Connect API key, .p8, base64
+#   APPLE_API_KEY_ID            its key ID
+#   APPLE_API_ISSUER            its issuer ID
 
 name: CI
 
 on:
   push:
     branches: [master]
+    tags: ['v*']
   pull_request:
     branches: [master]
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SBCL_VERSION: 2.6.8
+  # The commit sbcl-2.6.8 tags, so a moved tag cannot change what is built.
+  SBCL_COMMIT: 62f4bd103264bf1c92fb4fc68305b8307fdd06fb
 
 jobs:
   test:
     name: macOS arm64
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 90
+
+    env:
+      HAVE_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      HAVE_NOTARY_KEY: ${{ secrets.APPLE_API_KEY != '' }}
 
     defaults:
       run:
@@ -50,10 +76,40 @@ jobs:
           brew install lispnik/tecgraf/tecgraf-im
           brew list --versions sbcl tecgraf-im
 
+      - name: Cache the bundle's SBCL
+        id: sbcl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/sbcl-${{ env.SBCL_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sbcl-${{ env.SBCL_COMMIT }}-safepoint-nozstd
+
+      - name: Build the bundle's SBCL
+        if: steps.sbcl-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          # GitHub's mirror rather than SourceForge, whose downloads time out.
+          git clone --quiet --depth 1 --branch "sbcl-$SBCL_VERSION" https://github.com/sbcl/sbcl.git sbcl
+          cd sbcl
+          test "$(git rev-parse HEAD)" = "$SBCL_COMMIT" \
+            || { echo "::error::sbcl-$SBCL_VERSION is not $SBCL_COMMIT"; exit 1; }
+          sh make.sh --prefix="$HOME/sbcl-$SBCL_VERSION" --xc-host=sbcl \
+                     --with-sb-thread --with-sb-safepoint --with-sb-ldb \
+                     --without-sb-core-compression > build.log 2>&1 \
+            || { tail -100 build.log; exit 1; }
+          sh install.sh > /dev/null
+
+      - name: Use the bundle's SBCL
+        run: |
+          sbcl="$HOME/sbcl-$SBCL_VERSION/bin/sbcl"
+          "$sbcl" --version
+          otool -L "$sbcl"
+          echo "SBCL=$sbcl" >> "$GITHUB_ENV"
+
       - name: Install ocicl
         run: |
+          # Built with Homebrew's SBCL: it is a tool, and goes in no bundle.
           git clone --depth 1 https://github.com/ocicl/ocicl.git "$HOME/ocicl-src"
-          ( cd "$HOME/ocicl-src" && sbcl --non-interactive --load setup.lisp )
+          ( cd "$HOME/ocicl-src" && /opt/homebrew/bin/sbcl --non-interactive --load setup.lisp )
           bin="$(find "$HOME" -type f -name ocicl 2>/dev/null | grep -v '/ocicl-src/' | head -1)"
           test -n "$bin" || { echo "::error::ocicl binary not found after setup"; exit 1; }
           dirname "$bin" >> "$GITHUB_PATH"
@@ -83,6 +139,29 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Import the signing certificate
+        if: env.HAVE_CERTIFICATE == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+                   -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+                       | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)
+          test -n "$identity" || { echo "::error::no Developer ID Application identity in MACOS_CERTIFICATE"; exit 1; }
+          echo "MACOS_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
       - name: Build the bundle
         run: make app
 
@@ -107,36 +186,66 @@ jobs:
 
       - name: Check the bundle carries its libraries
         run: |
-          # Everything IM links against is in Contents/Frameworks, so the
-          # bundle runs on a Mac without Homebrew.
+          # Everything the runtime and IM link against is in the bundle or in
+          # the system, so the bundle runs on a Mac without Homebrew.
           contents="build/Image Converter.app/Contents"
-          outside() {
-            for f in "$@"; do otool -L "$f" | tail -n +2; done \
-              | grep -vE "@loader_path|@executable_path|@rpath|/usr/lib/|/System/" || true
-          }
-          libraries=$(outside "$contents"/Frameworks/*.dylib)
-          if [ -n "$libraries" ]; then
-            echo "::error::bundled libraries link from outside the bundle:"
-            echo "$libraries"
+          outside=$(for f in "$contents"/MacOS/image-converter "$contents"/Frameworks/*.dylib; do
+                      otool -L "$f" | tail -n +2 | sed "s|^|$(basename "$f"):|"
+                    done | grep -vE "@loader_path|@executable_path|@rpath|/usr/lib/|/System/" || true)
+          if [ -n "$outside" ]; then
+            echo "::error::the bundle links libraries from outside it:"
+            echo "$outside"
             exit 1
-          fi
-          # The runtime is the building SBCL's.  Homebrew's links Homebrew's
-          # libzstd, for core compression, so this artifact is for testing
-          # only; a release is built with an SBCL configured
-          # --without-sb-core-compression (make release-check).
-          runtime=$(outside "$contents"/MacOS/image-converter)
-          if [ -n "$(echo "$runtime" | grep -v libzstd)" ]; then
-            echo "::error::the runtime links from outside the system:"
-            echo "$runtime"
-            exit 1
-          elif [ -n "$runtime" ]; then
-            echo "::warning::the runtime links Homebrew's libzstd; this bundle runs only where Homebrew's zstd is installed"
           fi
 
-      - name: Upload the bundle
-        run: ditto -c -k --keepParent "build/Image Converter.app" "$RUNNER_TEMP/Image-Converter.zip"
+      - name: Notarise the bundle
+        if: env.HAVE_CERTIFICATE == 'true' && env.HAVE_NOTARY_KEY == 'true'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          echo "$APPLE_API_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool store-credentials ci --key "$RUNNER_TEMP/notary.p8" \
+                --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+                --keychain "$SIGNING_KEYCHAIN"
+          rm "$RUNNER_TEMP/notary.p8"
+          make notarize NOTARY_PROFILE=ci
+          echo "NOTARISED=true" >> "$GITHUB_ENV"
+
+      - name: Make the disk image
+        run: |
+          if [ "$NOTARISED" = true ]; then
+            make dmg
+            make notarize-dmg NOTARY_PROFILE=ci
+          else
+            make disk-image
+          fi
+          dmg=$(ls dist/*.dmg)
+          echo "DMG=$dmg" >> "$GITHUB_ENV"
+          echo "DMG_NAME=$(basename "$dmg" .dmg)" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Image-Converter-macos-arm64
-          path: ${{ runner.temp }}/Image-Converter.zip
+          name: ${{ env.DMG_NAME }}
+          path: app/${{ env.DMG }}
+          compression-level: 0
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/.*:version "\(.*\)".*/\1/p' image-converter-app.asd | head -1)
+          test "$GITHUB_REF_NAME" = "v$version" \
+            || { echo "::error::tag $GITHUB_REF_NAME is not v$version, the version in image-converter-app.asd"; exit 1; }
+          notes=""
+          if [ "$NOTARISED" != true ]; then
+            notes="This build is not notarised. macOS will refuse to open it until its quarantine is removed: \`xattr -dr com.apple.quarantine \"/Applications/Image Converter.app\"\`."
+          fi
+          gh release create "$GITHUB_REF_NAME" "$DMG" --title "Image Converter $version" \
+             --generate-notes --notes "$notes"
+
+      - name: Remove the signing keychain
+        if: always() && env.SIGNING_KEYCHAIN != ''
+        run: security delete-keychain "$SIGNING_KEYCHAIN"

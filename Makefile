@@ -5,12 +5,13 @@
 #   make run     run the application from source, unbundled
 #   make app     build "build/Image Converter.app"
 #   make icon    draw res/icon.png again, from tools/icon.lisp
-#   make screenshot INPUT=folder   draw the window into doc/, converting FOLDER
+#   make screenshot [INPUT=folder]  draw the window into doc/
 #   make clean   remove the bundle and the fasls
 #
 #   make release-check   refuse a bundle that cannot be shipped
 #   make notarize        notarise the bundle and staple the ticket
 #   make dmg             a signed disk image of the notarised bundle, in dist/
+#   make disk-image      a disk image of the bundle as it is, notarised or not
 #   make notarize-dmg    notarise the disk image and staple it
 #   make release         all four
 #
@@ -59,7 +60,7 @@ LISP = $(SBCL) --non-interactive --no-userinit --no-sysinit \
          --eval '(require :asdf)' --eval '$(REGISTRY)'
 
 .PHONY: deps test run app icon screenshot clean \
-        release-check notarize dmg notarize-dmg release
+        release-check notarize dmg disk-image notarize-dmg release
 
 deps:
 	ocicl install
@@ -119,6 +120,12 @@ notarize: release-check
 dmg:
 	@xcrun stapler validate "$(APP)" > /dev/null || { \
 	  echo "error: $(APP) has no notarisation ticket; make notarize first" >&2; exit 1; }
+	$(MAKE) disk-image
+
+# The same, whatever the bundle's signature: CI makes one of every build.  The
+# image is signed only when there is an identity to sign it with.
+disk-image:
+	@test -d "$(APP)" || { echo "error: no $(APP); make app first" >&2; exit 1; }
 	rm -rf "$(DIST)/stage" "$(DMG)"
 	mkdir -p "$(DIST)/stage"
 	ditto "$(APP)" "$(DIST)/stage/Image Converter.app"
@@ -126,7 +133,7 @@ dmg:
 	hdiutil create -volname "Image Converter $(VERSION)" -srcfolder "$(DIST)/stage" \
 	        -ov -format UDZO "$(DMG)"
 	rm -rf "$(DIST)/stage"
-	codesign --force --sign "$(MACOS_SIGNING_IDENTITY)" --timestamp "$(DMG)"
+	$(if $(MACOS_SIGNING_IDENTITY),codesign --force --sign "$(MACOS_SIGNING_IDENTITY)" --timestamp "$(DMG)")
 	@echo "built $(DMG)"
 
 notarize-dmg:
